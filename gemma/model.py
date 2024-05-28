@@ -564,3 +564,186 @@ class GemmaForCausalLM(nn.Module):
             )['model_state_dict'],
             strict=False,
         )
+
+input_len = 1
+kv_len = 4096
+
+class GemmaAttentionONNX(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        quant: bool,
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+
+        assert self.num_heads % self.num_kv_heads == 0
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        self.scaling = self.head_dim**-0.5
+
+        self.qkv_proj = Linear(
+            self.hidden_size,
+            (self.num_heads + 2 * self.num_kv_heads) * self.head_dim,
+            quant=quant)
+        self.o_proj = Linear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            quant=quant)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        # freqs_cis: torch.Tensor,
+        # kv_write_indices: torch.Tensor,
+        # kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        # mask: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states_shape = hidden_states.shape
+        assert len(hidden_states_shape) == 3
+
+        batch_size, input_len, _ = hidden_states_shape
+
+        qkv = self.qkv_proj(hidden_states)
+        xq, xk, xv = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                               dim=-1)
+
+        xq = xq.view(batch_size, -1, self.num_heads, self.head_dim)
+        xk = xk.view(batch_size, -1, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, -1, self.num_kv_heads, self.head_dim)
+
+        # Positional embedding.
+        # xq = apply_rotary_emb(xq, freqs_cis=freqs_cis)
+        # xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
+
+        # Write new kv cache.
+        # [batch_size, input_len, n_local_kv_heads, head_dim]
+        # k_cache, v_cache = kv_cache
+        # k_cache.index_copy_(1, kv_write_indices, xk)
+        # v_cache.index_copy_(1, kv_write_indices, xv)
+
+        key = F.pad(xk, (0, 0, 0, 0, kv_len - input_len, 0))
+        value = F.pad(xv, (0, 0, 0, 0, kv_len - input_len, 0))
+        if self.num_kv_heads != self.num_heads:
+            # [batch_size, max_seq_len, n_local_heads, head_dim]
+            key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=2)
+            value = torch.repeat_interleave(value,
+                                            self.num_queries_per_kv,
+                                            dim=2)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        q = xq.transpose(1, 2)
+        # [batch_size, n_local_heads, max_seq_len, head_dim]
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+
+        # [batch_size, n_local_heads, input_len, max_seq_len]
+        scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+        # scores = scores + mask
+        scores = F.softmax(scores.float(), dim=-1).type_as(q)
+
+        # [batch_size, n_local_heads, input_len, head_dim]
+        output = torch.matmul(scores, v)
+
+        # [batch_size, input_len, hidden_dim]
+        output = (output.transpose(1, 2).contiguous().view(
+            batch_size, input_len, -1))
+        output = self.o_proj(output)
+        return output
+
+
+class GemmaDecoderLayerONNX(nn.Module):
+
+    def __init__(
+        self,
+        config: gemma_config.GemmaConfig,
+    ):
+        super().__init__()
+        self.self_attn = GemmaAttentionONNX(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            quant=config.quant,
+        )
+        self.mlp = GemmaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant=config.quant,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        rope_theta = getattr(config, 'rope_theta', 10000)
+        self.freqs_cis = precompute_freqs_cis(config.head_dim,
+                                         kv_len * 2,
+                                         theta=rope_theta)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        # freqs_cis: torch.Tensor,
+        # kv_write_indices: torch.Tensor,
+        # kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        # mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Self Attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            # freqs_cis=self.freqs_cis,
+            # kv_write_indices=kv_write_indices,
+            # kv_cache=kv_cache,
+            # mask=mask,
+        )
+        hidden_states = residual + hidden_states
+
+        # MLP
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+import io
+import onnx
+from onnxsim import simplify
+
+if __name__ == '__main__':
+    # config = gemma_config.GemmaConfig(vocab_size=256000, max_position_embeddings=8192, num_hidden_layers=18, num_attention_heads=8, num_key_value_heads=1, hidden_size=2048, intermediate_size=16384, head_dim=256, rms_norm_eps=1e-06, dtype='bfloat16', quant=False, tokenizer='/home/t-muyanhu_1/.cache/kagglehub/models/google/gemma/pyTorch/2b-it/2/tokenizer.model')
+    config = gemma_config.GemmaConfig()
+    model = GemmaDecoderLayerONNX(config)
+    model.eval()
+    input = torch.randn(1, input_len, config.hidden_size)
+    model_name = "gemma.onnx"
+    buffer = io.BytesIO()
+    with torch.no_grad():
+        torch.onnx.export(model, input, buffer, opset_version=13)
+        buffer.seek(0, 0)
+
+        onnx_model = onnx.load_model(buffer)
+        onnx_model, success = simplify(onnx_model)
+        assert success
+        new_buffer = io.BytesIO()
+        onnx.save(onnx_model, new_buffer)
+        buffer = new_buffer
+        buffer.seek(0, 0)
+
+    if buffer.getbuffer().nbytes > 0:
+        with open(model_name, "wb") as f:
+            f.write(buffer.read())
