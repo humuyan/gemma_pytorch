@@ -515,6 +515,7 @@ class GemmaForCausalLM(nn.Module):
         # Prefill up to min_prompt_len tokens, then treat other prefill as
         # decode and ignore output.
         for i in range(max_seq_len - min_prompt_len):
+            # torch.cuda.nvtx.range_push(f"iteration_{i}_0")
             next_token_ids = self(
                 input_token_ids=input_token_ids_tensor,
                 input_positions=input_positions_tensor,
@@ -526,6 +527,8 @@ class GemmaForCausalLM(nn.Module):
                 top_ps=top_ps_tensor,
                 top_ks=top_ks_tensor,
             )
+            # torch.cuda.nvtx.range_pop()
+            # torch.cuda.nvtx.range_push(f"iteration_{i}_1")
 
             curr_prompt_mask = prompt_mask_tensor.index_select(
                 1, output_index).squeeze(dim=1)
@@ -542,6 +545,7 @@ class GemmaForCausalLM(nn.Module):
             output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
                 device)
             output_index = output_index + 1
+            # torch.cuda.nvtx.range_pop()
 
         # Detokenization.
         token_ids = token_ids_tensor.tolist()
