@@ -703,6 +703,7 @@ class GemmaForCausalLM(nn.Module):
                 del state_dict  # Save memory.
                 gc.collect()
 
+batch_size = 16
 input_len = 1
 kv_len = 4096
 
@@ -713,8 +714,12 @@ class GemmaAttentionONNX(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
+        attn_logit_softcapping: Optional[float],
+        query_pre_attn_scalar: Optional[int],
         head_dim: int,
         quant: bool,
+        attn_type: gemma_config.AttentionType,
+        sliding_window_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -730,7 +735,10 @@ class GemmaAttentionONNX(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        self.scaling = self.head_dim**-0.5
+        if query_pre_attn_scalar is not None:
+            self.scaling = query_pre_attn_scalar**-0.5
+        else:
+            self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -740,6 +748,27 @@ class GemmaAttentionONNX(nn.Module):
             self.num_heads * self.head_dim,
             self.hidden_size,
             quant=quant)
+
+        self.attn_type = attn_type
+        self.sliding_window_size = sliding_window_size
+        self.attn_logit_softcapping = attn_logit_softcapping
+
+        self.cache_k = torch.zeros(
+            (
+                batch_size,
+                kv_len,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+        )
+        self.cache_v = torch.zeros(
+            (
+                batch_size,
+                kv_len,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+        )
 
     def forward(
         self,
@@ -753,6 +782,7 @@ class GemmaAttentionONNX(nn.Module):
         assert len(hidden_states_shape) == 3
 
         batch_size, input_len, _ = hidden_states_shape
+        start_pos = kv_len - 1
 
         qkv = self.qkv_proj(hidden_states)
         xq, xk, xv = qkv.split([self.q_size, self.kv_size, self.kv_size],
@@ -772,8 +802,11 @@ class GemmaAttentionONNX(nn.Module):
         # k_cache.index_copy_(1, kv_write_indices, xk)
         # v_cache.index_copy_(1, kv_write_indices, xv)
 
-        key = F.pad(xk, (0, 0, 0, 0, kv_len - input_len, 0))
-        value = F.pad(xv, (0, 0, 0, 0, kv_len - input_len, 0))
+        self.cache_k[:, start_pos : start_pos + input_len] = xk
+        self.cache_v[:, start_pos : start_pos + input_len] = xv
+
+        key = self.cache_k[:, : start_pos + input_len]
+        value = self.cache_v[:, : start_pos + input_len]
         if self.num_kv_heads != self.num_heads:
             # [batch_size, max_seq_len, n_local_heads, head_dim]
             key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=2)
@@ -788,7 +821,21 @@ class GemmaAttentionONNX(nn.Module):
         v = value.transpose(1, 2)
 
         # [batch_size, n_local_heads, input_len, max_seq_len]
-        scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
+        q.mul_(self.scaling)
+        scores = torch.matmul(q, k.transpose(2, 3))
+        if (
+            self.attn_type == gemma_config.AttentionType.LOCAL_SLIDING
+            and self.sliding_window_size is not None
+        ):
+            all_ones = torch.ones_like(mask)
+            sliding_mask = torch.triu(
+                all_ones, -1 * self.sliding_window_size + 1
+            ) * torch.tril(all_ones, self.sliding_window_size - 1)
+            mask = torch.where(sliding_mask == 1, mask, -2.3819763e38)
+        if self.attn_logit_softcapping is not None:
+            scores = scores / self.attn_logit_softcapping
+            scores = torch.tanh(scores)
+            scores = scores * self.attn_logit_softcapping
         # scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
 
@@ -858,29 +905,101 @@ class GemmaDecoderLayerONNX(nn.Module):
 
         return hidden_states
 
+class Gemma2DecoderLayerONNX(nn.Module):
+    def __init__(
+        self,
+        config: gemma_config.GemmaConfig,
+        attn_type: gemma_config.AttentionType,
+    ):
+        super().__init__()
+        self.self_attn = GemmaAttentionONNX(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            attn_logit_softcapping=config.attn_logit_softcapping,
+            query_pre_attn_scalar=config.query_pre_attn_scalar,
+            head_dim=config.head_dim,
+            quant=config.quant,
+            attn_type=attn_type,
+            sliding_window_size=config.sliding_window_size,
+        )
+        self.mlp = GemmaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant=config.quant,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.use_pre_ffw_norm
+            else None
+        )
+        self.post_feedforward_layernorm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.use_post_ffw_norm
+            else None
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        # freqs_cis: torch.Tensor,
+        # kv_write_indices: torch.Tensor,
+        # kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        # mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Self Attention
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            # freqs_cis=freqs_cis,
+            # kv_write_indices=kv_write_indices,
+            # kv_cache=kv_cache,
+            # mask=mask,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # MLP
+        residual = hidden_states
+        if self.pre_feedforward_layernorm is not None:
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if self.post_feedforward_layernorm is not None:
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
 import io
 import onnx
 from onnxsim import simplify
 
 if __name__ == '__main__':
     # config = gemma_config.GemmaConfig(vocab_size=256000, max_position_embeddings=8192, num_hidden_layers=18, num_attention_heads=8, num_key_value_heads=1, hidden_size=2048, intermediate_size=16384, head_dim=256, rms_norm_eps=1e-06, dtype='bfloat16', quant=False, tokenizer='/home/t-muyanhu_1/.cache/kagglehub/models/google/gemma/pyTorch/2b-it/2/tokenizer.model')
-    config = gemma_config.GemmaConfig()
-    model = GemmaDecoderLayerONNX(config)
+    # config = gemma_config.GemmaConfig()
+    # model = GemmaDecoderLayerONNX(config)
+    config = gemma_config.get_model_config("9b")
+    config.dtype = "float16"
+    model = Gemma2DecoderLayerONNX(config, gemma_config.AttentionType.GLOBAL)
     model.eval()
-    input = torch.randn(1, input_len, config.hidden_size)
-    model_name = "gemma.onnx"
-    buffer = io.BytesIO()
+    input = torch.randn(16, input_len, config.hidden_size)
+    model_name = "gemma2.onnx"
     with torch.no_grad():
-        torch.onnx.export(model, input, buffer, opset_version=13)
-        buffer.seek(0, 0)
+        torch.onnx.export(model, input, model_name, opset_version=13)
 
-        onnx_model = onnx.load_model(buffer)
-        onnx_model, success = simplify(onnx_model)
-        assert success
-        new_buffer = io.BytesIO()
-        onnx.save(onnx_model, new_buffer)
-        buffer = new_buffer
-        buffer.seek(0, 0)
+    onnx_model = onnx.load_model(model_name)
+    onnx_model, success = simplify(onnx_model)
+    assert success
+    new_buffer = io.BytesIO()
+    onnx.save(onnx_model, new_buffer)
+    buffer = new_buffer
+    buffer.seek(0, 0)
 
     if buffer.getbuffer().nbytes > 0:
         with open(model_name, "wb") as f:
