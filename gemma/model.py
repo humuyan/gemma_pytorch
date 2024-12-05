@@ -22,8 +22,6 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 from gemma import config as gemma_config
 from gemma import tokenizer
 
-torch.set_default_dtype(torch.bfloat16)
-
 class Sampler(nn.Module):
 
     def __init__(self, vocab_size: int):
@@ -735,27 +733,47 @@ from onnxsim import simplify
 
 if __name__ == '__main__':
     # config = gemma_config.GemmaConfig(vocab_size=256000, max_position_embeddings=8192, num_hidden_layers=18, num_attention_heads=8, num_key_value_heads=1, hidden_size=2048, intermediate_size=16384, head_dim=256, rms_norm_eps=1e-06, dtype='bfloat16', quant=False, tokenizer='/home/t-muyanhu_1/.cache/kagglehub/models/google/gemma/pyTorch/2b-it/2/tokenizer.model')
-    config = gemma_config.GemmaConfig()
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device('cuda')
+    config = gemma_config.GemmaConfig(num_attention_heads=16, num_key_value_heads=8, hidden_size=3584, intermediate_size=14336)
     model = GemmaDecoderLayerONNX(config)
     model.eval()
     BS = 16
     input = torch.randn(BS, input_len, config.hidden_size)
     k_cache, v_cache = [torch.zeros(BS, kv_len, config.num_key_value_heads, config.head_dim) for _ in range(2)]
     mask = torch.randn(1, 1, input_len, kv_len)
-    model_name = "gemma_bs16.onnx"
-    buffer = io.BytesIO()
-    with torch.no_grad():
-        torch.onnx.export(model, (input, (k_cache, v_cache), mask), buffer, opset_version=13)
-        buffer.seek(0, 0)
 
-        onnx_model = onnx.load_model(buffer)
-        onnx_model, success = simplify(onnx_model)
-        assert success
-        new_buffer = io.BytesIO()
-        onnx.save(onnx_model, new_buffer)
-        buffer = new_buffer
-        buffer.seek(0, 0)
+    if False:
+        model_name = f"gemma_bs{BS}.onnx"
+        buffer = io.BytesIO()
+        with torch.no_grad():
+            torch.onnx.export(model, (input, (k_cache, v_cache), mask), buffer)
+            buffer.seek(0, 0)
 
-    if buffer.getbuffer().nbytes > 0:
-        with open(model_name, "wb") as f:
-            f.write(buffer.read())
+            onnx_model = onnx.load_model(buffer)
+            onnx_model, success = simplify(onnx_model)
+            assert success
+            new_buffer = io.BytesIO()
+            onnx.save(onnx_model, new_buffer)
+            buffer = new_buffer
+            buffer.seek(0, 0)
+
+        if buffer.getbuffer().nbytes > 0:
+            with open(model_name, "wb") as f:
+                f.write(buffer.read())
+    else:
+        import time
+        warm_up = 1000
+        test = 1000
+        model = torch.compile(model)
+
+        with torch.no_grad():
+            for _ in range(warm_up):
+                model(input, (k_cache, v_cache), mask)
+            torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(test):
+                model(input, (k_cache, v_cache), mask)
+            torch.cuda.synchronize()
+            end = time.time()
+            print(f"Time: {(end - start) / test * 1e3:.4f} ms")
