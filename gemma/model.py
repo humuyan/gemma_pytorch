@@ -22,6 +22,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 from gemma import config as gemma_config
 from gemma import tokenizer
 
+torch.set_default_dtype(torch.bfloat16)
 
 class Sampler(nn.Module):
 
@@ -612,8 +613,8 @@ class GemmaAttentionONNX(nn.Module):
         hidden_states: torch.Tensor,
         # freqs_cis: torch.Tensor,
         # kv_write_indices: torch.Tensor,
-        # kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        # mask: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states_shape = hidden_states.shape
         assert len(hidden_states_shape) == 3
@@ -634,12 +635,15 @@ class GemmaAttentionONNX(nn.Module):
 
         # Write new kv cache.
         # [batch_size, input_len, n_local_kv_heads, head_dim]
-        # k_cache, v_cache = kv_cache
-        # k_cache.index_copy_(1, kv_write_indices, xk)
-        # v_cache.index_copy_(1, kv_write_indices, xv)
+        k_cache, v_cache = kv_cache
+        kv_write_indices = torch.tensor([input_len - 1])
+        k_cache.index_copy_(1, kv_write_indices, xk)
+        v_cache.index_copy_(1, kv_write_indices, xv)
 
-        key = F.pad(xk, (0, 0, 0, 0, kv_len - input_len, 0))
-        value = F.pad(xv, (0, 0, 0, 0, kv_len - input_len, 0))
+        # key = F.pad(xk, (0, 0, 0, 0, kv_len - input_len, 0))
+        # value = F.pad(xv, (0, 0, 0, 0, kv_len - input_len, 0))
+        key = k_cache
+        value = v_cache
         if self.num_kv_heads != self.num_heads:
             # [batch_size, max_seq_len, n_local_heads, head_dim]
             key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=2)
@@ -655,7 +659,7 @@ class GemmaAttentionONNX(nn.Module):
 
         # [batch_size, n_local_heads, input_len, max_seq_len]
         scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
-        # scores = scores + mask
+        scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
 
         # [batch_size, n_local_heads, input_len, head_dim]
@@ -701,8 +705,8 @@ class GemmaDecoderLayerONNX(nn.Module):
         hidden_states: torch.Tensor,
         # freqs_cis: torch.Tensor,
         # kv_write_indices: torch.Tensor,
-        # kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        # mask: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -711,10 +715,11 @@ class GemmaDecoderLayerONNX(nn.Module):
             hidden_states=hidden_states,
             # freqs_cis=self.freqs_cis,
             # kv_write_indices=kv_write_indices,
-            # kv_cache=kv_cache,
-            # mask=mask,
+            kv_cache=kv_cache,
+            mask=mask,
         )
         hidden_states = residual + hidden_states
+        return hidden_states
 
         # MLP
         residual = hidden_states
@@ -733,11 +738,14 @@ if __name__ == '__main__':
     config = gemma_config.GemmaConfig()
     model = GemmaDecoderLayerONNX(config)
     model.eval()
-    input = torch.randn(1, input_len, config.hidden_size)
-    model_name = "gemma.onnx"
+    BS = 16
+    input = torch.randn(BS, input_len, config.hidden_size)
+    k_cache, v_cache = [torch.zeros(BS, kv_len, config.num_key_value_heads, config.head_dim) for _ in range(2)]
+    mask = torch.randn(1, 1, input_len, kv_len)
+    model_name = "gemma_bs16.onnx"
     buffer = io.BytesIO()
     with torch.no_grad():
-        torch.onnx.export(model, input, buffer, opset_version=13)
+        torch.onnx.export(model, (input, (k_cache, v_cache), mask), buffer, opset_version=13)
         buffer.seek(0, 0)
 
         onnx_model = onnx.load_model(buffer)
