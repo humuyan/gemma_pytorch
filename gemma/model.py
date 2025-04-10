@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Gemma model implementation."""
+import os
+os.environ["PJRT_DEVICE"] = "CUDA"
+os.environ["GPU_NUM_DEVICES"]="1"
 
 import re
 import torch
@@ -659,9 +662,11 @@ class GemmaAttentionONNX(nn.Module):
         scores = torch.matmul(q, k.transpose(2, 3)) * self.scaling
         scores = scores + mask
         scores = F.softmax(scores.float(), dim=-1).type_as(q)
+        # return scores
 
         # [batch_size, n_local_heads, input_len, head_dim]
         output = torch.matmul(scores, v)
+        # return output
 
         # [batch_size, input_len, hidden_dim]
         output = (output.transpose(1, 2).contiguous().view(
@@ -716,6 +721,7 @@ class GemmaDecoderLayerONNX(nn.Module):
             kv_cache=kv_cache,
             mask=mask,
         )
+        # return hidden_states
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -728,22 +734,57 @@ class GemmaDecoderLayerONNX(nn.Module):
         return hidden_states
 
 import io
-import onnx
-from onnxsim import simplify
+import sys
+import time
 
 if __name__ == '__main__':
     # config = gemma_config.GemmaConfig(vocab_size=256000, max_position_embeddings=8192, num_hidden_layers=18, num_attention_heads=8, num_key_value_heads=1, hidden_size=2048, intermediate_size=16384, head_dim=256, rms_norm_eps=1e-06, dtype='bfloat16', quant=False, tokenizer='/home/t-muyanhu_1/.cache/kagglehub/models/google/gemma/pyTorch/2b-it/2/tokenizer.model')
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
+    if sys.argv[1] == "profile-xla":
+        import torch_xla
+        torch.set_default_device(torch_xla.device())
+    else:
+        torch.set_default_device('cuda')
     config = gemma_config.GemmaConfig(num_attention_heads=16, num_key_value_heads=8, hidden_size=3584, intermediate_size=14336)
     model = GemmaDecoderLayerONNX(config)
     model.eval()
-    BS = 16
+    BS = int(sys.argv[2])
     input = torch.randn(BS, input_len, config.hidden_size)
     k_cache, v_cache = [torch.zeros(BS, kv_len, config.num_key_value_heads, config.head_dim) for _ in range(2)]
     mask = torch.randn(1, 1, input_len, kv_len)
+    warm_up = 1000
+    test = 1000
 
-    if False:
+    if sys.argv[1] == "profile":
+        model = torch.compile(model)
+
+        with torch.no_grad():
+            for _ in range(warm_up):
+                model(input, (k_cache, v_cache), mask)
+                torch.cuda.synchronize()
+            start = time.time()
+            for _ in range(test):
+                model(input, (k_cache, v_cache), mask)
+                torch.cuda.synchronize()
+            end = time.time()
+            print(f"Time: {(end - start) / test * 1e3:.4f} ms")
+    elif sys.argv[1] == "profile-xla":
+        import torch_xla.core.xla_model as xm
+        model = torch.compile(model, backend="openxla")
+
+        with torch.no_grad():
+            for _ in range(warm_up):
+                model(input, (k_cache, v_cache), mask)
+                xm.mark_step()
+            start = time.time()
+            for _ in range(test):
+                model(input, (k_cache, v_cache), mask)
+                xm.mark_step()
+            end = time.time()
+            print(f"Time: {(end - start) / test * 1e3:.4f} ms")
+    else:
+        import onnx
+        from onnxsim import simplify
         model_name = f"gemma_bs{BS}.onnx"
         buffer = io.BytesIO()
         with torch.no_grad():
@@ -761,19 +802,3 @@ if __name__ == '__main__':
         if buffer.getbuffer().nbytes > 0:
             with open(model_name, "wb") as f:
                 f.write(buffer.read())
-    else:
-        import time
-        warm_up = 1000
-        test = 1000
-        model = torch.compile(model)
-
-        with torch.no_grad():
-            for _ in range(warm_up):
-                model(input, (k_cache, v_cache), mask)
-            torch.cuda.synchronize()
-            start = time.time()
-            for _ in range(test):
-                model(input, (k_cache, v_cache), mask)
-            torch.cuda.synchronize()
-            end = time.time()
-            print(f"Time: {(end - start) / test * 1e3:.4f} ms")
