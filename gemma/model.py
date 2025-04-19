@@ -758,6 +758,7 @@ if __name__ == '__main__':
     if sys.argv[1] == "profile":
         model = torch.compile(model)
 
+        torch.cuda.reset_peak_memory_stats()
         with torch.no_grad():
             for _ in range(warm_up):
                 model(input, (k_cache, v_cache), mask)
@@ -768,6 +769,8 @@ if __name__ == '__main__':
                 torch.cuda.synchronize()
             end = time.time()
             print(f"Time: {(end - start) / test * 1e3:.4f} ms")
+        peak_mem = torch.cuda.max_memory_allocated()
+        print(f"Peak GPU memory usage {peak_mem/1e6:.3f} MB")
     elif sys.argv[1] == "profile-xla":
         import torch_xla.core.xla_model as xm
         model = torch.compile(model, backend="openxla")
